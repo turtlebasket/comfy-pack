@@ -120,6 +120,7 @@ async def _get_models(
     model_filter: set[str] | None = None,
     ensure_sha=True,
     ensure_source=True,
+    lazy_sha=False,
 ) -> list:
     proc = await asyncio.subprocess.create_subprocess_exec(
         "git",
@@ -132,20 +133,28 @@ async def _get_models(
 
     models = []
     model_filenames = [
-        os.path.abspath(line.strip().strip('"').replace('\\\\', '/'))
+        os.path.abspath(line.strip().strip('"').replace("\\\\", "/"))
         for line in stdout.decode().splitlines()
-        if not os.path.basename(line.strip().strip('"').replace('\\\\', '/')).startswith(".")
+        if not os.path.basename(
+            line.strip().strip('"').replace("\\\\", "/")
+        ).startswith(".")
     ]
-    model_hashes = await async_batch_get_sha256(
-        model_filenames,
-        cache_only=not (ensure_sha or store_models),
-    )
+    if lazy_sha:
+        model_hashes = {f: None for f in model_filenames}
+        print(
+            f"Skipped SHA256 calculation (lazy_sha=True) for {len(model_filenames)} files"
+        )
+    else:
+        model_hashes = await async_batch_get_sha256(
+            model_filenames,
+            cache_only=not (ensure_sha or store_models),
+        )
 
     for filename in model_filenames:
         # Skip if file doesn't exist
         if not os.path.exists(filename):
             continue
-            
+
         relpath = os.path.relpath(filename, folder_paths.base_path)
 
         model_data = {
@@ -222,22 +231,201 @@ async def _write_inputs(path: ZPath, data: dict) -> None:
                     shutil.copyfileobj(input_file, f)
 
 
+async def _write_models(path: ZPath, models: list, bundle_models: bool) -> None:
+    """Write model files to the zip archive if bundle_models is True"""
+    if not bundle_models:
+        return
+
+    print("Package => Writing bundled models")
+    if isinstance(path, Path):
+        path.joinpath("models").mkdir(exist_ok=True)
+
+    total_models = len([m for m in models if not m.get("disabled", False)])
+    processed = 0
+
+    for model in models:
+        if model.get("disabled", False):
+            continue
+
+        sha256 = model.get("sha256")
+        filename = model.get("filename")
+
+        if not filename:
+            continue
+
+        # Get the full path to the model file
+        model_path = Path(folder_paths.base_path) / filename
+        if not model_path.exists():
+            print(f"Warning: Model file {filename} not found, skipping")
+            continue
+
+        processed += 1
+        file_size = model_path.stat().st_size
+        size_mb = file_size / (1024 * 1024)
+        print(
+            f"Bundling model {processed}/{total_models}: {filename} ({size_mb:.1f} MB)"
+        )
+
+        # For bundling, use filename as the key instead of SHA256 to avoid expensive hashing
+        copy_start = time.time()
+
+        if not sha256:
+            # For bundling, just use a simple hash of the filename - no file content hashing
+            import hashlib
+
+            sha256 = hashlib.sha256(filename.encode("utf-8")).hexdigest()
+            model["sha256"] = sha256
+            print(f"Using filename-based key for {filename}: {sha256[:16]}...")
+
+        # Simple copy - no hashing during copy
+        target_path = path.joinpath("models").joinpath(sha256)
+        if isinstance(path, Path):
+            shutil.copy2(model_path, target_path)
+        else:
+            # For zipfile paths, use temp file approach for much better performance
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                temp_path = Path(temp_file.name)
+
+            # Copy to temp file (fast filesystem operation)
+            shutil.copy2(model_path, temp_path)
+
+            # Add to zip in one operation (fast)
+            zf = path.root  # Get the zipfile object
+            zf.write(temp_path, f"models/{sha256}")
+
+            # Clean up temp file
+            temp_path.unlink()
+
+        copy_time = time.time() - copy_start
+        speed_mbps = size_mb / copy_time if copy_time > 0 else 0
+        print(f"Copied {filename} in {copy_time:.2f}s ({speed_mbps:.1f} MB/s)")
+
+        # Mark model as bundled in metadata
+        model["bundled"] = True
+        print(f"Bundled model: {filename} -> models/{sha256}")
+
+
+def _validate_output_path(output_dir: str) -> tuple[bool, str]:
+    """Validate output directory path for security and accessibility"""
+    if not output_dir:
+        return True, ""
+
+    try:
+        # Check for directory traversal attempts
+        if ".." in output_dir:
+            return False, "Directory traversal not allowed"
+
+        output_path = Path(output_dir).resolve()
+
+        # Check if path is absolute
+        if not output_path.is_absolute():
+            return False, "Output path must be absolute"
+
+        # Check if parent directory exists and is writable
+        parent_dir = output_path.parent
+        if not parent_dir.exists():
+            return False, f"Parent directory does not exist: {parent_dir}"
+
+        if not os.access(parent_dir, os.W_OK):
+            return False, f"No write permission to directory: {parent_dir}"
+
+        return True, str(output_path)
+
+    except Exception as e:
+        return False, f"Invalid path: {str(e)}"
+
+
 @PromptServer.instance.routes.post("/bentoml/pack")
 async def pack_workspace(request):
     data = await request.json()
-    TEMP_FOLDER.mkdir(exist_ok=True)
-    older_than_1h = time.time() - 60 * 60
-    for file in TEMP_FOLDER.iterdir():
-        if file.is_file() and file.stat().st_ctime < older_than_1h:
-            file.unlink()
 
-    zip_filename = f"{uuid.uuid4()}.zip"
+    # Validate output directory if provided
+    output_dir = data.get("output_dir", "").strip()
+    if output_dir:
+        is_valid, validated_path = _validate_output_path(output_dir)
+        if not is_valid:
+            return web.json_response(
+                {
+                    "result": "error",
+                    "error": f"Cannot write to directory: {validated_path}",
+                },
+                status=400,
+            )
+        output_dir = validated_path
 
-    with zipfile.ZipFile(TEMP_FOLDER / zip_filename, "w") as zf:
-        path = zipfile.Path(zf)
-        await _prepare_pack(path, data)
+    # Get filename from data or use default
+    filename = data.get("filename", "comfy-pack-pkg").strip()
+    if not filename:
+        filename = "comfy-pack-pkg"
 
-    return web.json_response({"download_url": f"/bentoml/download/{zip_filename}"})
+    # Clean filename to be safe for filesystem
+    filename = "".join(c for c in filename if c.isalnum() or c in ("-", "_", "."))
+    if not filename:
+        filename = "comfy-pack-pkg"
+
+    zip_filename = f"{filename}.cpack.zip"
+
+    if output_dir:
+        # Direct write to specified directory
+        try:
+            output_path = Path(output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+
+            final_zip_path = output_path / zip_filename
+
+            # Use no compression only when bundling models (they're already compressed)
+            compression = (
+                zipfile.ZIP_STORED
+                if data.get("bundle_models", False)
+                else zipfile.ZIP_DEFLATED
+            )
+            with zipfile.ZipFile(final_zip_path, "w", compression=compression) as zf:
+                path = zipfile.Path(zf)
+                await _prepare_pack(
+                    path, data, bundle_models=data.get("bundle_models", False)
+                )
+
+            # Get file size
+            file_size = final_zip_path.stat().st_size
+
+            return web.json_response(
+                {"result": "success", "path": str(final_zip_path), "size": file_size}
+            )
+
+        except Exception as e:
+            return web.json_response(
+                {"result": "error", "error": f"Failed to write to directory: {str(e)}"},
+                status=500,
+            )
+    else:
+        # Use existing temp folder flow for download
+        TEMP_FOLDER.mkdir(exist_ok=True)
+        older_than_1h = time.time() - 60 * 60
+        for file in TEMP_FOLDER.iterdir():
+            if file.is_file() and file.stat().st_ctime < older_than_1h:
+                file.unlink()
+
+        temp_zip_filename = f"{uuid.uuid4()}.zip"
+
+        # Use no compression only when bundling models (they're already compressed)
+        compression = (
+            zipfile.ZIP_STORED
+            if data.get("bundle_models", False)
+            else zipfile.ZIP_DEFLATED
+        )
+        with zipfile.ZipFile(
+            TEMP_FOLDER / temp_zip_filename, "w", compression=compression
+        ) as zf:
+            path = zipfile.Path(zf)
+            await _prepare_pack(
+                path, data, bundle_models=data.get("bundle_models", False)
+            )
+
+        return web.json_response(
+            {"download_url": f"/bentoml/download/{temp_zip_filename}"}
+        )
 
 
 class DevServer:
@@ -438,17 +626,21 @@ async def _prepare_pack(
     data: dict,
     store_models: bool = False,
     ensure_source: bool = True,
+    bundle_models: bool = False,
 ) -> None:
     model_filter = set(data.get("models", []))
     models = await _get_models(
         store_models=store_models,
         model_filter=model_filter,
-        ensure_source=ensure_source,
+        ensure_source=ensure_source
+        and not bundle_models,  # Skip source lookup when bundling
+        lazy_sha=bundle_models,  # Skip SHA256 when bundling
     )
 
     await _write_snapshot(working_dir, data, models)
     await _write_workflow(working_dir, data)
     await _write_inputs(working_dir, data)
+    await _write_models(working_dir, models, bundle_models)
 
 
 @PromptServer.instance.routes.post("/bentoml/model/query")

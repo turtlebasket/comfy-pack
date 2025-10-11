@@ -289,6 +289,7 @@ def retrieve_models(
     download: bool = True,
     all_models: bool = False,
     verbose: int = 0,
+    pack_dir: Path | None = None,
 ):
     """Retrieve models from user downloads"""
     print("Retrieving models")
@@ -299,9 +300,14 @@ def retrieve_models(
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     for model in models:
-        sha = model["sha256"]
+        sha = model.get("sha256")
         filename = model["filename"]
         disabled = model.get("disabled", False)
+
+        # Skip models without SHA256 hash
+        if sha is None:
+            print(f"Warning: Model {filename} has no SHA256 hash, skipping")
+            continue
         if (workspace / filename).exists():
             if not (MODEL_DIR / sha).exists() and (workspace / filename).is_file():
                 shutil.move(workspace / filename, MODEL_DIR / sha)
@@ -315,6 +321,29 @@ def retrieve_models(
 
         if disabled and not all_models:
             continue
+
+        # Handle bundled models first
+        if model.get("bundled", False) and pack_dir is not None:
+            bundled_model_path = pack_dir / "models" / sha
+            if bundled_model_path.exists():
+                print(f"Extracting bundled model: {filename}")
+                target_path = MODEL_DIR / sha
+
+                # Copy bundled model to global cache
+                shutil.copy2(bundled_model_path, target_path)
+
+                # Skip SHA256 verification for bundled models (already verified at pack time)
+                if verbose > 0:
+                    print(f"Skipping SHA256 verification for bundled model: {filename}")
+
+                # Create symlink to workspace
+                create_model_symlink(MODEL_DIR, sha, workspace, filename)
+                print(f"Successfully extracted bundled model: {filename}")
+                continue
+            else:
+                print(
+                    f"Warning: Bundled model {filename} not found in archive, falling back to download"
+                )
 
         if not download:
             continue
@@ -471,6 +500,7 @@ def install(
                 workspace,
                 verbose=verbose,
                 download=False,
+                pack_dir=pack_dir,
             )
 
         if preheat:
@@ -483,7 +513,13 @@ def install(
             ) as _:
                 pass
         if prepare_models:
-            retrieve_models(snapshot, workspace, verbose=verbose, all_models=all_models)
+            retrieve_models(
+                snapshot,
+                workspace,
+                verbose=verbose,
+                all_models=all_models,
+                pack_dir=pack_dir,
+            )
 
 
 required_files = ["snapshot.json"]

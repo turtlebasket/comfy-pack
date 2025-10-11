@@ -653,6 +653,18 @@ async function createPackModal() {
         <label for="filename">Name</label>
         <input type="text" class="cpack-input" name="filename" value="${localStorage.getItem('cpack-bento-name') || 'comfy-pack-pkg'}" />
       </div>
+      <div class="cpack-form-item">
+        <label style="display: flex; align-items: center; margin-bottom: 10px;">
+          <input type="checkbox" id="save-to-directory" style="margin-right: 8px;" />
+          Save directly to directory (server-side)
+        </label>
+        <div id="output-directory-container" style="display: none;">
+          <label for="output-directory" style="display: block; margin-top: 10px; margin-bottom: 5px;">Path to output</label>
+          <input type="text" class="cpack-input" id="output-directory" name="output_directory" 
+                 placeholder="/path/to/output/dir" 
+                 value="${localStorage.getItem('cpack-output-dir') || ''}" />
+        </div>
+      </div>
       <div id="package-options-container"></div>
     `;
 
@@ -684,20 +696,60 @@ async function createPackModal() {
       confirmButton.disabled = false;
     });
 
+    // Handle directory output checkbox
+    const saveToDirectoryCheckbox = form.querySelector("#save-to-directory");
+    const outputDirectoryContainer = form.querySelector("#output-directory-container");
+    const outputDirectoryInput = form.querySelector("#output-directory");
+
+    const toggleDirectoryInput = () => {
+      if (saveToDirectoryCheckbox.checked) {
+        outputDirectoryContainer.style.display = "block";
+        outputDirectoryInput.required = true;
+      } else {
+        outputDirectoryContainer.style.display = "none";
+        outputDirectoryInput.required = false;
+      }
+    };
+
+    // Add event listener for checkbox change
+    saveToDirectoryCheckbox.addEventListener("change", toggleDirectoryInput);
+
+    // Initial state
+    toggleDirectoryInput();
+
     confirmButton.onclick = () => {
       const filename = form.querySelector("input[name='filename']").value.trim();
-      if (filename) {
-        // Save filename to localStorage
-        localStorage.setItem('cpack-bento-name', filename);
-        const selectedData = packageOptions.getSelectedData();
-        close();
-        resolve({
-          filename,
-          models: selectedData.models,
-          files: selectedData.files,
-          systemPackages: selectedData.systemPackages
-        });
+      const outputDir = form.querySelector("input[name='output_directory']").value.trim();
+      
+      // Validate required fields
+      if (!filename) {
+        return; // Filename is required
       }
+      
+      if (saveToDirectoryCheckbox.checked && !outputDir) {
+        // Directory is required when checkbox is checked
+        outputDirectoryInput.focus();
+        return;
+      }
+      
+      // Save filename to localStorage
+      localStorage.setItem('cpack-bento-name', filename);
+      
+      // Save output directory if provided
+      if (outputDir) {
+        localStorage.setItem('cpack-output-dir', outputDir);
+      }
+      
+      const selectedData = packageOptions.getSelectedData();
+      close();
+      resolve({
+        filename,
+        output_dir: outputDir,
+        models: selectedData.models,
+        files: selectedData.files,
+        bundle_models: selectedData.bundle_models,
+        systemPackages: selectedData.systemPackages
+      });
     };
 
     cancelButton.onclick = () => {
@@ -815,6 +867,50 @@ async function unpackAction() {
       closeButton.onclick = close;
 }
 
+function createSuccessModal(filePath, fileSize) {
+  const modal = document.createElement("div");
+  modal.className = "cpack-modal";
+  modal.id = "success-modal";
+
+  const title = document.createElement("div");
+  title.textContent = "Success!";
+  title.className = "cpack-title";
+
+  const content = document.createElement("div");
+  content.innerHTML = `
+    <div style="margin-bottom: 20px;">
+      <p style="margin-bottom: 15px;">Package saved to:</p>
+      <div style="background: #1d1d1d; padding: 10px; border-radius: 4px; font-family: monospace; word-break: break-all; margin-bottom: 10px;">
+        ${filePath}
+      </div>
+      ${fileSize ? `<p style="color: #888; font-size: 0.9em;">Size: ${formatFileSize(fileSize)}</p>` : ''}
+    </div>
+  `;
+
+  const buttonContainer = document.createElement("div");
+  buttonContainer.className = "cpack-btn-container";
+
+  const closeButton = document.createElement("button");
+  closeButton.textContent = "Close";
+  closeButton.className = "cpack-btn";
+
+  buttonContainer.appendChild(closeButton);
+  modal.appendChild(title);
+  modal.appendChild(content);
+  modal.appendChild(buttonContainer);
+
+  const { close } = createModal(modal);
+  closeButton.onclick = close;
+}
+
+function formatFileSize(bytes) {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
 async function packageAction() {
   if (document.getElementById("input-modal")) return;
   if (document.getElementById("download-modal")) return;
@@ -833,6 +929,9 @@ async function packageAction() {
       workflow_api,
       models: result.models,
       files: result.files,
+      bundle_models: result.bundle_models,
+      output_dir: result.output_dir,
+      filename: result.filename,
       system_packages: result.systemPackages
     });
 
@@ -840,17 +939,24 @@ async function packageAction() {
     const resp = await api.fetchApi("/bentoml/pack", { method: "POST", body, headers: { "Content-Type": "application/json" } });
 
     downloadModal.updateProgress(80);
-    const downloadUrl = (await resp.json())["download_url"];
+    const responseData = await resp.json();
 
     downloadModal.updateProgress(100);
-    const link = document.createElement("a");
-    link.href = downloadUrl;
-    link.download = result.filename + ".cpack.zip";
-    link.click();
+    downloadModal.close();
 
-    setTimeout(() => {
-      downloadModal.close();
-    }, 1000);
+    // Handle different response types
+    if (responseData.result === "success" && responseData.path) {
+      // Direct write to directory
+      createSuccessModal(responseData.path, responseData.size);
+    } else if (responseData.download_url) {
+      // Download through browser
+      const link = document.createElement("a");
+      link.href = responseData.download_url;
+      link.download = result.filename + ".cpack.zip";
+      link.click();
+    } else {
+      throw new Error(responseData.error || "Unknown response format");
+    }
   } catch (error) {
     console.error("Package failed:", error);
     downloadModal.close();
@@ -969,6 +1075,15 @@ class PackageOptions {
           <summary style="cursor: pointer; margin-bottom: 10px;">Package Options</summary>
           <div style="padding: 10px; background: #1d1d1d; border-radius: 4px;">
             <div class="cpack-form-item">
+              <label style="display: flex; align-items: center; margin-bottom: 10px;">
+                <input type="checkbox" id="bundle-models" style="margin-right: 8px;" />
+                Bundle model files in zip
+              </label>
+              <p style="font-size: 0.85em; color: #888; margin: 5px 0;">
+                ⚠️ This will significantly increase the zip file size but eliminates the need for model downloads during unpacking.
+              </p>
+            </div>
+            <div class="cpack-form-item">
               <details>
                 <summary style="cursor: pointer; margin-bottom: 10px;">Models (<span data-models-count="${this.modelsListId}">0</span> selected)</summary>
                 <div id="${this.modelsListId}">
@@ -1033,6 +1148,7 @@ class PackageOptions {
     return {
       models: this.modelListComponent.getSelectedModels(),
       files: this.fileListComponent.getSelectedFiles(),
+      bundle_models: this.container.querySelector("#bundle-models").checked,
       systemPackages: Array.from(this.container.querySelectorAll("input[name='systemPackages']"))
         .map(input => input.value)
         .filter(Boolean)
