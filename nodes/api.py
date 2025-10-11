@@ -231,6 +231,29 @@ async def _write_inputs(path: ZPath, data: dict) -> None:
                     shutil.copyfileobj(input_file, f)
 
 
+def _update_model_metadata_for_bundling(models: list) -> None:
+    """Update model metadata before bundling (compute SHA256 from filename and mark as bundled)"""
+    import hashlib
+
+    for model in models:
+        if model.get("disabled", False):
+            continue
+
+        filename = model.get("filename")
+        if not filename:
+            continue
+
+        model_path = Path(folder_paths.base_path) / filename
+        if not model_path.exists():
+            continue
+
+        if not model.get("sha256"):
+            sha256 = hashlib.sha256(filename.encode("utf-8")).hexdigest()
+            model["sha256"] = sha256
+
+        model["bundled"] = True
+
+
 async def _write_models(path: ZPath, models: list, bundle_models: bool) -> None:
     """Write model files to the zip archive if bundle_models is True"""
     if not bundle_models:
@@ -266,16 +289,7 @@ async def _write_models(path: ZPath, models: list, bundle_models: bool) -> None:
             f"Bundling model {processed}/{total_models}: {filename} ({size_mb:.1f} MB)"
         )
 
-        # For bundling, use filename as the key instead of SHA256 to avoid expensive hashing
         copy_start = time.time()
-
-        if not sha256:
-            # For bundling, just use a simple hash of the filename - no file content hashing
-            import hashlib
-
-            sha256 = hashlib.sha256(filename.encode("utf-8")).hexdigest()
-            model["sha256"] = sha256
-            print(f"Using filename-based key for {filename}: {sha256[:16]}...")
 
         # Simple copy - no hashing during copy
         target_path = path.joinpath("models").joinpath(sha256)
@@ -301,9 +315,6 @@ async def _write_models(path: ZPath, models: list, bundle_models: bool) -> None:
         copy_time = time.time() - copy_start
         speed_mbps = size_mb / copy_time if copy_time > 0 else 0
         print(f"Copied {filename} in {copy_time:.2f}s ({speed_mbps:.1f} MB/s)")
-
-        # Mark model as bundled in metadata
-        model["bundled"] = True
         print(f"Bundled model: {filename} -> models/{sha256}")
 
 
@@ -636,6 +647,9 @@ async def _prepare_pack(
         and not bundle_models,  # Skip source lookup when bundling
         lazy_sha=bundle_models,  # Skip SHA256 when bundling
     )
+
+    if bundle_models:
+        _update_model_metadata_for_bundling(models)
 
     await _write_snapshot(working_dir, data, models)
     await _write_workflow(working_dir, data)
